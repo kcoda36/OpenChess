@@ -231,11 +231,13 @@ const char* ssid     = "YourNetworkName";
 const char* password = "YourPassword";
 ```
 
-### `bt_chess.ino` — ESP-NOW Ghost Chess (Two Boards)
+### `bt_chess.ino` — Physical Two-Board Chess (ESP-NOW)
 
-Connects two OpenChess boards over ESP-NOW (no router needed). Each board holds its own physical pieces; the opponent's pieces appear as purple ghost LEDs. Roles (White/Black) are assigned automatically by MAC address. Press **Button A (IO9)** to reset and re-pair.
+Connects two OpenChess boards over ESP-NOW (no router needed). Both boards carry all 32 physical pieces. On your turn, pick up a piece and place it — the legal-move LEDs guide you. Your move is sent wirelessly to the other board, which lights the FROM square **orange** and the TO square **green**. The other player must physically move the piece before their turn begins. Roles (White/Black) are assigned automatically by MAC address. Press **Button A (IO9)** to reset and re-pair.
 
-No credentials needed — boards discover each other automatically.
+### `ghost_chess.ino` — Ghost Chess (ESP-NOW, Two Boards)
+
+A variant of two-board play where each board only carries its own physical pieces (White keeps rows 1–2, Black keeps rows 7–8). The opponent's pieces are shown as permanent **purple ghost LEDs** — no physical mirroring required. When the opponent captures one of your pieces, that square flashes red until you remove it. Press **Button A (IO9)** to reset and re-pair.
 
 ### `pong.ino` — Board Pong
 
