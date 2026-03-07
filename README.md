@@ -221,6 +221,10 @@ void loop() {
 
 All examples are in the `Examples/` folder. Load them directly in the Arduino IDE — they are self-contained `.ino` files.
 
+### `long_chess.ino` — Long Chess (two boards, 8×16 playing field)
+
+Two boards placed end-to-end form one 8×16 board. White pieces start on Board A (rows 0–7), Black pieces on Board B (rows 8–15). Any piece can move anywhere across the full 16-row field — a queen, rook, or bishop can slide all the way from one board to the other. When a piece crosses, the player physically carries it to the adjacent board; the receiving board's sensor detects the placement. Legal-move LEDs ripple across **both boards simultaneously** in distance order from the lifted piece. Boards pair over ESP-NOW (no router). Higher MAC = White.
+
 ### `chess.ino` — Two-Player Chess (single board, no WiFi)
 
 The simplest starting point. Power on, place all 32 pieces in the starting position, and the game begins automatically. Both players get full legal-move LED hints on their turn. Pawn promotion auto-queens. Press **IO9** to reset at any time. No libraries beyond `Adafruit_NeoPixel` required.
