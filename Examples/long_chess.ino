@@ -251,10 +251,23 @@ bool isAttacked(int r, int c, char byColor) {
     if (nr>=0&&nr<16&&nc>=0&&nc<8&&gBoard[nr][nc]==eK) return true;
   }
   char eR=(byColor=='w')?'R':'r', eQ=(byColor=='w')?'Q':'q', eB=(byColor=='w')?'B':'b';
-  int dirs[4][2]={{1,0},{-1,0},{0,1},{0,-1}}, diag[4][2]={{1,1},{1,-1},{-1,1},{-1,-1}};
-  for (int i = 0; i < 4; i++) {
+  // Straight rays for rook/queen (no reflection)
+  int dirs[4][2]={{1,0},{-1,0},{0,1},{0,-1}};
+  for (int i=0;i<4;i++){
     for (int s=1;s<16;s++){int nr=r+s*dirs[i][0],nc=c+s*dirs[i][1];if(nr<0||nr>=16||nc<0||nc>=8)break;char t=gBoard[nr][nc];if(t!=' '){if(t==eR||t==eQ)return true;break;}}
-    for (int s=1;s<16;s++){int nr=r+s*diag[i][0],nc=c+s*diag[i][1];if(nr<0||nr>=16||nc<0||nc>=8)break;char t=gBoard[nr][nc];if(t!=' '){if(t==eB||t==eQ)return true;break;}}
+  }
+  // Reflecting diagonal rays for bishop/queen
+  int diagDr[4]={1,1,-1,-1}, diagDc[4]={1,-1,1,-1};
+  for (int i=0;i<4;i++){
+    int nr=r, nc=c, dc=diagDc[i];
+    for (int s=0;s<16;s++){
+      nr+=diagDr[i]; nc+=dc;
+      if(nc<0){nc=-nc;dc=-dc;}
+      if(nc>7){nc=14-nc;dc=-dc;}
+      if(nr<0||nr>=16)break;
+      char t=gBoard[nr][nc];
+      if(t!=' '){if(t==eB||t==eQ)return true;break;}
+    }
   }
   return false;
 }
@@ -289,6 +302,23 @@ void getMoves(int row, int col, int &mc, int mv[][2]) {
     }
   };
 
+  // Diagonal line that reflects off the left (col 0) and right (col 7) walls.
+  // The row direction stays constant; the column direction flips on each bounce.
+  // The ray stops only when it hits the top/bottom boundary or a blocking piece.
+  auto reflLine = [&](int dr, int initDc) {
+    int nr=row, nc=col, dc=initDc;
+    for (int s=0; s<16; s++) {
+      nr += dr;
+      nc += dc;
+      if (nc < 0)  { nc = -nc;      dc = -dc; }  // bounce off left wall
+      if (nc > 7)  { nc = 14 - nc;  dc = -dc; }  // bounce off right wall
+      if (nr < 0 || nr >= 16) break;
+      char t=gBoard[nr][nc];
+      if (t==' ')  { mv[mc][0]=nr; mv[mc][1]=nc; mc++; }
+      else { if ((t>='a'&&t<='z')!=(clr=='b')){ mv[mc][0]=nr; mv[mc][1]=nc; mc++; } break; }
+    }
+  };
+
   switch (pt) {
     case 'P': {
       // White pawns move toward row 15; Black toward row 0
@@ -308,9 +338,9 @@ void getMoves(int row, int col, int &mc, int mv[][2]) {
       break;
     }
     case 'R': line(1,0);line(-1,0);line(0,1);line(0,-1); break;
-    case 'B': line(1,1);line(1,-1);line(-1,1);line(-1,-1); break;
+    case 'B': reflLine(1,1);reflLine(1,-1);reflLine(-1,1);reflLine(-1,-1); break;
     case 'Q': line(1,0);line(-1,0);line(0,1);line(0,-1);
-              line(1,1);line(1,-1);line(-1,1);line(-1,-1); break;
+              reflLine(1,1);reflLine(1,-1);reflLine(-1,1);reflLine(-1,-1); break;
     case 'N': { int nd[8][2]={{2,1},{1,2},{-1,2},{-2,1},{-2,-1},{-1,-2},{1,-2},{2,-1}};for(int i=0;i<8;i++)push(row+nd[i][0],col+nd[i][1]); break; }
     case 'K': { int kd[8][2]={{1,0},{-1,0},{0,1},{0,-1},{1,1},{1,-1},{-1,1},{-1,-1}};for(int i=0;i<8;i++)push(row+kd[i][0],col+kd[i][1]); break; }
   }
@@ -706,9 +736,9 @@ bool handlePassiveTurn() {
       }
     }
 
-    // ── Cross-board lift detected: watch for return or placement ──
+    // ── Cross-board lift on MY board: watch for return to origin ──
+    // (active player previously crossed a piece here and is now moving it again)
     if (liftGR != -1) {
-      // Piece returned to origin
       if (sensor[liftLR][liftGC] && !sensorPrev[liftLR][liftGC]) {
         sendMsg(MSG_CANCEL);
         hlCount=0; strip.clear(); strip.show();
@@ -716,8 +746,13 @@ bool handlePassiveTurn() {
         memcpy(sensorPrev,sensor,sizeof(sensor));
         continue;
       }
+    }
 
-      // Placement on a highlighted square
+    // ── Watch for placement on any highlighted square ───────────
+    // Runs whenever highlights exist — covers both:
+    //   (a) active player lifted from their own board and crosses here, and
+    //   (b) active player lifted a piece already on my board.
+    if (hlCount > 0) {
       for (int lr2=0;lr2<8;lr2++) for (int c2=0;c2<8;c2++) {
         if (!sensor[lr2][c2] || sensorPrev[lr2][c2]) continue;
         int gr2=toG(lr2);
