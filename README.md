@@ -221,6 +221,10 @@ void loop() {
 
 All examples are in the `Examples/` folder. Load them directly in the Arduino IDE — they are self-contained `.ino` files.
 
+### `chess.ino` — Two-Player Chess (single board, no WiFi)
+
+The simplest starting point. Power on, place all 32 pieces in the starting position, and the game begins automatically. Both players get full legal-move LED hints on their turn. Pawn promotion auto-queens. Press **IO9** to reset at any time. No libraries beyond `Adafruit_NeoPixel` required.
+
 ### `bot_chess.ino` — WiFi Chess vs. Stockfish AI
 
 Play chess against a Stockfish engine hosted at [chess-api.com](https://chess-api.com). Press **Button B (IO10)** for two-player mode or **Button A (IO9)** for bot mode. In bot mode, set difficulty by placing a pawn on row 4 (rank 5 from White's side) — columns A–H map to levels 1–8 (green = easy, red = hard).
