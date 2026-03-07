@@ -221,6 +221,26 @@ void loop() {
 
 All examples are in the `Examples/` folder. Load them directly in the Arduino IDE — they are self-contained `.ino` files.
 
+### `four_player_chess.ino` — 4-Player Chess (5 boards, + formation)
+
+Five boards are physically arranged in a cross / plus shape:
+
+```
+          [P1]  White — top arm
+[P2]  [CENTER]  [P3]  Green / Blue — side arms
+          [P4]  Red   — bottom arm
+```
+
+The global playing field is a 24 × 24 grid, valid squares forming the + shape. Each arm provides an 8 × 8 home board; the center 8 × 8 square is always neutral. Pieces can move freely across all five boards — a queen can slide through the center from any arm to any other arm.
+
+**Role assignment** is automatic: all five boards broadcast their MAC address on startup; sorted ascending they become P1 (White), P2 (Green), P3 (Blue), P4 (Red), and CENTER. Each board flashes its assigned color so you can identify placement.
+
+**Center board** displays permanently colored edges (top = P1 White, left = P2 Green, right = P3 Blue, bottom = P4 Red) throughout the game — it has no pieces of its own and is always passive.
+
+**Setup**: Each player's board glows its color on the two rows/columns closest to the center (orientation guide). Empty home squares pulse dimly to indicate where pieces should be placed. Once all four player boards confirm pieces are ready, the game starts.
+
+**Legal-move ripple** spreads outward across all five boards simultaneously in distance order, highlighting valid destinations no matter which physical board they are on. **Check** triggers a full-board red flash on the player in check. **Elimination** happens when a king is captured — that player's board flashes their color and they are skipped for the rest of the game. Press **IO9** to reset and re-pair at any time.
+
 ### `long_chess.ino` — Long Chess (two boards, 8×16 playing field)
 
 Two boards placed end-to-end form one 8×16 board. White pieces start on Board A (rows 0–7), Black pieces on Board B (rows 8–15). Any piece can move anywhere across the full 16-row field — a queen, rook, or bishop can slide all the way from one board to the other. When a piece crosses, the player physically carries it to the adjacent board; the receiving board's sensor detects the placement. Legal-move LEDs ripple across **both boards simultaneously** in distance order from the lifted piece. Boards pair over ESP-NOW (no router). Higher MAC = White.
