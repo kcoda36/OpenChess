@@ -18,13 +18,15 @@
 //     index 0 = P1  index 1 = P2  index 2 = P3
 //     index 3 = P4  index 4 = CENTER
 //
-//   Center board shows colored edges during the whole game:
+//   All player boards: pieces always start on local rows 0–1
+//   (back rank row 0, pawns row 1). Local row 7 faces center.
+//   Center board shows colored edges throughout the game:
 //     top = P1 (White)  left = P2 (Green)
 //     right = P3 (Blue) bottom = P4 (Red)
 //
 //   No castling / no en passant. Pawns auto-promote to queen.
 //   Player eliminated when their king is captured.
-//   IO9 = reset at any time.
+//   IO9 = reset.  Any board reboot triggers auto-reconnect.
 // ============================================================
 
 #include <esp_now.h>
@@ -59,19 +61,68 @@ inline int     plOf(uint8_t p)          { return p >> 4; }
 inline int     tyOf(uint8_t p)          { return p & 0xF; }
 inline bool    isEm(uint8_t p)          { return p == 0; }
 
-// ── Roles and coordinate system ───────────────────────────────
+// ── Roles ─────────────────────────────────────────────────────
 // 1=P1(top/W)  2=P2(left/G)  3=P3(right/B)  4=P4(bot/R)  5=CENTER
 uint8_t myRole = 0;
 
-// Local (lr,lc) → global (gr,gc): add these offsets per role
-const int GR_OFF[6] = {0,  0,  8,  8, 16,  8};
-const int GC_OFF[6] = {0,  8,  0, 16,  8,  8};
-
-int  gRow(int lr)         { return lr + GR_OFF[myRole]; }
-int  gCol(int lc)         { return lc + GC_OFF[myRole]; }
-int  locR(int gr)         { return gr - GR_OFF[myRole]; }
-int  locC(int gc)         { return gc - GC_OFF[myRole]; }
-bool onMe(int gr, int gc) { int lr=locR(gr),lc=locC(gc); return lr>=0&&lr<8&&lc>=0&&lc<8; }
+// ── Coordinate mapping (supports board rotation per role) ─────
+//
+// Every player board uses the same physical orientation:
+//   local row 0 = back rank (far from center)
+//   local row 7 = near-center edge
+//   local col 0-7 = left-to-right from the player's perspective
+//
+// Global ← local:
+//   P1: gr=lr,      gc=lc+8
+//   P2: gr=lc+8,    gc=lr          (board rotated 90° CW in global space)
+//   P3: gr=lc+8,    gc=23-lr       (board rotated 90° CCW)
+//   P4: gr=23-lr,   gc=lc+8        (board flipped, near-center = global row 16)
+//   CENTER: gr=lr+8, gc=lc+8
+int gRow(int lr, int lc) {
+  switch(myRole) {
+    case 1: return lr;
+    case 2: return lc + 8;
+    case 3: return lc + 8;
+    case 4: return 23 - lr;
+    case 5: return lr + 8;
+  }
+  return -1;
+}
+int gCol(int lr, int lc) {
+  switch(myRole) {
+    case 1: return lc + 8;
+    case 2: return lr;
+    case 3: return 23 - lr;
+    case 4: return lc + 8;
+    case 5: return lc + 8;
+  }
+  return -1;
+}
+// Local ← global (inverse of above)
+int locR(int gr, int gc) {
+  switch(myRole) {
+    case 1: return gr;
+    case 2: return gc;
+    case 3: return 23 - gc;
+    case 4: return 23 - gr;
+    case 5: return gr - 8;
+  }
+  return -1;
+}
+int locC(int gr, int gc) {
+  switch(myRole) {
+    case 1: return gc - 8;
+    case 2: return gr - 8;
+    case 3: return gr - 8;
+    case 4: return gc - 8;
+    case 5: return gc - 8;
+  }
+  return -1;
+}
+bool onMe(int gr, int gc) {
+  int lr=locR(gr,gc), lc=locC(gr,gc);
+  return lr>=0&&lr<8&&lc>=0&&lc<8;
+}
 
 bool validSq(int r, int c) {
   if (r<0||r>=24||c<0||c>=24) return false;
@@ -88,17 +139,17 @@ int squareRole(int gr, int gc) {
   return 5;                  // CENTER
 }
 
-// Pawn movement direction (dr, dc) indexed by player 1-4
+// Pawn movement direction (dr, dc) in GLOBAL coords, indexed by player 1-4
 const int PDR[5] = {0,  1,  0,  0, -1};
 const int PDC[5] = {0,  0,  1, -1,  0};
 
 // ── Global game state ─────────────────────────────────────────
-uint8_t gBoard[24][24];                    // full + board
-bool    sensor[8][8], sensorPrev[8][8];   // local physical rows
-bool    eliminated[5] = {};               // [1..4]
+uint8_t gBoard[24][24];
+bool    sensor[8][8], sensorPrev[8][8];
+bool    eliminated[5] = {};
 
 void setGLED(int gr, int gc, uint32_t c) {
-  if (onMe(gr,gc)) strip.setPixelColor(locR(gr)*8+locC(gc), c);
+  if (onMe(gr,gc)) strip.setPixelColor(locR(gr,gc)*8+locC(gr,gc), c);
 }
 
 uint32_t pColor(int pl) {
@@ -120,17 +171,16 @@ uint32_t dimColor(int pl) {
   return 0;
 }
 
-// ── ESP-NOW ───────────────────────────────────────────────────
-// Message srcRole / dstRole: 0 = broadcast to all, 1-5 = specific role
+// ── ESP-NOW message protocol ──────────────────────────────────
 enum MsgType : uint8_t {
   MSG_HELLO=0,
-  MSG_ROLE_READY,   // I know my role and am ready to start
-  MSG_SETUP_DONE,   // my pieces are placed
-  MSG_LIFT,         // d[0]=gr, d[1]=gc — active piece lifted on MY board
-  MSG_HIGHLIGHT,    // d[0]=gr, d[1]=gc, d[2]=type(0=empty,1=cap)
-  MSG_CLEAR,        // clear all highlights on your board
-  MSG_PLACED,       // d[0]=gr, d[1]=gc — active piece placed on MY board
-  MSG_CANCEL,       // cross-board lift cancelled (piece returned)
+  MSG_ROLE_READY,   // I know my role and am ready
+  MSG_SETUP_DONE,   // my pieces are placed / CENTER is ready
+  MSG_LIFT,         // d[0]=gr, d[1]=gc
+  MSG_HIGHLIGHT,    // d[0]=gr, d[1]=gc, d[2]=type(0=empty,1=capture)
+  MSG_CLEAR,        // clear highlights
+  MSG_PLACED,       // d[0]=gr, d[1]=gc
+  MSG_CANCEL,       // cross-board lift cancelled
   MSG_MOVE,         // d[0]=fromGR, d[1]=fromGC, d[2]=toGR, d[3]=toGC
   MSG_ELIM,         // d[0]=eliminated player #
   MSG_RESET
@@ -141,14 +191,22 @@ struct __attribute__((packed)) Message {
 };
 
 uint8_t broadcastAddr[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-uint8_t roleMac[6][6];     // roleMac[role 1-5] = that board's MAC
+uint8_t roleMac[6][6];
 bool    roleKnown[6] = {};
 uint8_t myMac[6];
 
-volatile bool    msgPending  = false;
+// Single-slot message queue for game-play messages
+volatile bool    msgPending = false;
 volatile MsgType msgType;
 volatile uint8_t msgSrcRole, msgDstRole, msgData[4];
 uint8_t          msgSenderMac[6];
+
+// Sync counters updated directly in onRecv — never lost even during blocking ops
+volatile uint8_t gReadySet = 0;   // bit i = role i sent ROLE_READY
+volatile uint8_t gSetupSet = 0;   // bit i = role i sent SETUP_DONE
+
+// Set by onRecv when a known peer sends MSG_HELLO during gameplay (they rebooted)
+volatile bool reconnectNeeded = false;
 
 // Highlights received on passive board
 struct HLSq { uint8_t gr, gc, type; };
@@ -185,21 +243,25 @@ void searchAnim(int frame) {
   strip.show();
 }
 
-// Show the center board's four colored edges (only meaningful on CENTER role)
 void centerEdges() {
-  for(int c=0;c<8;c++) strip.setPixelColor(0*8+c, pColor(1));  // top = P1
-  for(int c=0;c<8;c++) strip.setPixelColor(7*8+c, pColor(4));  // bottom = P4
-  for(int r=0;r<8;r++) strip.setPixelColor(r*8+0, pColor(2));  // left = P2
-  for(int r=0;r<8;r++) strip.setPixelColor(r*8+7, pColor(3));  // right = P3
+  for(int c=0;c<8;c++) strip.setPixelColor(0*8+c, pColor(1));
+  for(int c=0;c<8;c++) strip.setPixelColor(7*8+c, pColor(4));
+  for(int r=0;r<8;r++) strip.setPixelColor(r*8+0, pColor(2));
+  for(int r=0;r<8;r++) strip.setPixelColor(r*8+7, pColor(3));
   strip.show();
 }
 
+// Non-blocking role flash: processes 10 ms ticks so onRecv still runs
 void roleFlash(int role) {
-  for (int f=0;f<4;f++) {
+  for (int f=0; f<4; f++) {
     strip.clear();
     if (role==5) { centerEdges(); }
     else { uint32_t c=pColor(role); if(f%2==0) for(int i=0;i<LED_COUNT;i++) strip.setPixelColor(i,c); strip.show(); }
-    delay(300);
+    for (int t=0; t<30; t++) {       // 30 × 10 ms = 300 ms per flash
+      if (msgPending) msgPending=false; // drain slot; gReadySet already updated
+      if (digitalRead(RESET_PIN)==LOW) { delay(50); if(digitalRead(RESET_PIN)==LOW) return; }
+      delay(10);
+    }
   }
   strip.clear(); strip.show();
 }
@@ -210,7 +272,7 @@ void illegalFlash(int gr, int gc) {
 }
 void captureAnim(int gr, int gc) {
   if (!onMe(gr,gc)) return;
-  float cx=locC(gc), cy=locR(gr);
+  float cx=locC(gr,gc), cy=locR(gr,gc);
   for (float r=0;r<6.0f;r+=0.8f) {
     strip.clear();
     for(int rr=0;rr<8;rr++) for(int cc=0;cc<8;cc++) { float dx=cc-cx,dy=rr-cy; if(fabsf(sqrtf(dx*dx+dy*dy)-r)<0.7f) strip.setPixelColor(rr*8+cc,strip.Color(255,0,0,0)); }
@@ -220,7 +282,7 @@ void captureAnim(int gr, int gc) {
 }
 void promotionAnim(int gr, int gc) {
   if (!onMe(gr,gc)) return;
-  int px=locR(gr)*8+locC(gc);
+  int px=locR(gr,gc)*8+locC(gr,gc);
   for(int f=0;f<5;f++) { strip.setPixelColor(px,strip.Color(255,200,0,100)); strip.show(); delay(120); strip.setPixelColor(px,0); strip.show(); delay(80); }
 }
 void checkFlash() {
@@ -240,13 +302,13 @@ void restorePassiveDisplay() {
 void initGBoard() {
   memset(gBoard, 0, sizeof(gBoard));
   const int bk[8] = {ROOK,KNIGHT,BISHOP,QUEEN,KING,BISHOP,KNIGHT,ROOK};
-  // P1: back rank row 0, pawns row 1, cols 8-15
+  // P1: back rank global row 0, pawns row 1, cols 8-15
   for(int i=0;i<8;i++) { gBoard[0][8+i]=mkPiece(1,bk[i]); gBoard[1][8+i]=mkPiece(1,PAWN); }
-  // P2: back rank col 0, pawns col 1, rows 8-15
+  // P2: back rank global col 0, pawns col 1, rows 8-15
   for(int i=0;i<8;i++) { gBoard[8+i][0]=mkPiece(2,bk[i]); gBoard[8+i][1]=mkPiece(2,PAWN); }
-  // P3: back rank col 23 (reversed), pawns col 22, rows 8-15
+  // P3: back rank global col 23, pawns col 22, rows 8-15  (reversed piece order)
   for(int i=0;i<8;i++) { gBoard[8+i][23]=mkPiece(3,bk[7-i]); gBoard[8+i][22]=mkPiece(3,PAWN); }
-  // P4: back rank row 23 (reversed), pawns row 22, cols 8-15
+  // P4: back rank global row 23, pawns row 22, cols 8-15  (reversed piece order)
   for(int i=0;i<8;i++) { gBoard[23][8+i]=mkPiece(4,bk[7-i]); gBoard[22][8+i]=mkPiece(4,PAWN); }
 }
 
@@ -266,7 +328,6 @@ bool onPromotion(int pl, int gr, int gc) {
   return false;
 }
 
-// Raw moves: no check filter
 void getMovesRaw(int gr, int gc, int &mc, int mv[][2]) {
   mc = 0;
   uint8_t piece = gBoard[gr][gc]; if(isEm(piece)) return;
@@ -275,7 +336,7 @@ void getMovesRaw(int gr, int gc, int &mc, int mv[][2]) {
     if(!validSq(r,c)) return false;
     uint8_t t=gBoard[r][c]; return isEm(t)||plOf(t)!=pl;
   };
-  auto push = [&](int r,int c) { if(canLand(r,c)){mv[mc][0]=r;mv[mc][1]=c;mc++;} };
+  auto push  = [&](int r,int c) { if(canLand(r,c)){mv[mc][0]=r;mv[mc][1]=c;mc++;} };
   auto slide = [&](int dr,int dc) {
     for(int s=1;s<24;s++) { int nr=gr+s*dr,nc=gc+s*dc; if(!validSq(nr,nc)) break;
       uint8_t t=gBoard[nr][nc]; if(isEm(t)){mv[mc][0]=nr;mv[mc][1]=nc;mc++;}
@@ -288,7 +349,6 @@ void getMovesRaw(int gr, int gc, int &mc, int mv[][2]) {
         mv[mc][0]=nr; mv[mc][1]=nc; mc++;
         if(onPawnStart(pl,gr,gc)) { int r2=nr+dr,c2=nc+dc; if(validSq(r2,c2)&&isEm(gBoard[r2][c2])){mv[mc][0]=r2;mv[mc][1]=c2;mc++;} }
       }
-      // Diagonal captures
       int cr1r,cr1c,cr2r,cr2c;
       if(dr!=0){cr1r=gr+dr;cr1c=gc-1;cr2r=gr+dr;cr2c=gc+1;}
       else     {cr1r=gr-1; cr1c=gc+dc;cr2r=gr+1; cr2c=gc+dc;}
@@ -304,27 +364,21 @@ void getMovesRaw(int gr, int gc, int &mc, int mv[][2]) {
   }
 }
 
-// Check if the given player's king is currently under attack
 bool isKingInCheck(int player) {
   int kr=-1, kc=-1;
   for(int r=0;r<24&&kr==-1;r++) for(int c=0;c<24&&kr==-1;c++)
     if(validSq(r,c)&&plOf(gBoard[r][c])==player&&tyOf(gBoard[r][c])==KING){kr=r;kc=c;}
   if(kr==-1) return false;
-
-  // Pawn attacks (direction depends on attacker's player)
   for(int ep=1;ep<=4;ep++) {
     if(ep==player) continue;
     int dr=PDR[ep], dc=PDC[ep];
     if(dr!=0) { for(int d=-1;d<=1;d+=2){int pr=kr-dr,pc=kc+d;if(validSq(pr,pc)&&plOf(gBoard[pr][pc])==ep&&tyOf(gBoard[pr][pc])==PAWN)return true;} }
     else      { for(int d=-1;d<=1;d+=2){int pr=kr+d,pc=kc-dc;if(validSq(pr,pc)&&plOf(gBoard[pr][pc])==ep&&tyOf(gBoard[pr][pc])==PAWN)return true;} }
   }
-  // Knight
   int nd[8][2]={{2,1},{1,2},{-1,2},{-2,1},{-2,-1},{-1,-2},{1,-2},{2,-1}};
   for(int i=0;i<8;i++){int nr=kr+nd[i][0],nc=kc+nd[i][1];if(validSq(nr,nc)&&!isEm(gBoard[nr][nc])&&plOf(gBoard[nr][nc])!=player&&tyOf(gBoard[nr][nc])==KNIGHT)return true;}
-  // King adjacency
   int kd[8][2]={{1,0},{-1,0},{0,1},{0,-1},{1,1},{1,-1},{-1,1},{-1,-1}};
   for(int i=0;i<8;i++){int nr=kr+kd[i][0],nc=kc+kd[i][1];if(validSq(nr,nc)&&!isEm(gBoard[nr][nc])&&plOf(gBoard[nr][nc])!=player&&tyOf(gBoard[nr][nc])==KING)return true;}
-  // Sliding pieces
   int drs[4]={1,-1,0,0},dcs[4]={0,0,1,-1},drd[4]={1,1,-1,-1},dcd[4]={1,-1,1,-1};
   for(int i=0;i<4;i++){
     for(int s=1;s<24;s++){int nr=kr+s*drs[i],nc=kc+s*dcs[i];if(!validSq(nr,nc))break;uint8_t t=gBoard[nr][nc];if(!isEm(t)){if(plOf(t)!=player&&(tyOf(t)==ROOK||tyOf(t)==QUEEN))return true;break;}}
@@ -333,18 +387,17 @@ bool isKingInCheck(int player) {
   return false;
 }
 
-// Legal moves (filtered to avoid self-check)
 void getMoves(int gr, int gc, int &mc, int mv[][2]) {
   getMovesRaw(gr, gc, mc, mv);
   uint8_t piece=gBoard[gr][gc]; int pl=plOf(piece);
-  int legal[64][2]; int lc=0;
+  int legal[64][2]; int lc2=0;
   for(int i=0;i<mc;i++) {
     int tr=mv[i][0], tc=mv[i][1]; uint8_t save=gBoard[tr][tc];
     gBoard[tr][tc]=piece; gBoard[gr][gc]=0;
-    if(!isKingInCheck(pl)){legal[lc][0]=tr;legal[lc][1]=tc;lc++;}
+    if(!isKingInCheck(pl)){legal[lc2][0]=tr;legal[lc2][1]=tc;lc2++;}
     gBoard[gr][gc]=piece; gBoard[tr][tc]=save;
   }
-  mc=lc; for(int i=0;i<lc;i++){mv[i][0]=legal[i][0];mv[i][1]=legal[i][1];}
+  mc=lc2; for(int i=0;i<lc2;i++){mv[i][0]=legal[i][0];mv[i][1]=legal[i][1];}
 }
 
 bool kingPresent(int player) {
@@ -364,33 +417,53 @@ void applyMoveToBoard(int fr, int fc, int tr, int tc) {
   if(tyOf(p)==PAWN && onPromotion(plOf(p),tr,tc)) { promotionAnim(tr,tc); gBoard[tr][tc]=mkPiece(plOf(p),QUEEN); }
 }
 
-// Check for newly captured kings and mark as eliminated
 void checkEliminations() {
   for(int pl=1;pl<=4;pl++) {
-    if(!eliminated[pl] && !kingPresent(pl)) {
-      eliminated[pl]=true;
-      elimAnim(pl);
-    }
+    if(!eliminated[pl] && !kingPresent(pl)) { eliminated[pl]=true; elimAnim(pl); }
   }
 }
 
 // ── ESP-NOW messaging ─────────────────────────────────────────
-// Send to a specific role (unicast) or broadcast (dst=0)
 void sendMsg(MsgType type, uint8_t dst, uint8_t d0=0,uint8_t d1=0,uint8_t d2=0,uint8_t d3=0) {
   Message msg; msg.type=type; msg.srcRole=myRole; msg.dstRole=dst;
   msg.d[0]=d0; msg.d[1]=d1; msg.d[2]=d2; msg.d[3]=d3;
   if(dst>0&&dst<=5&&roleKnown[dst]) esp_now_send(roleMac[dst],(uint8_t*)&msg,sizeof(msg));
   else                               esp_now_send(broadcastAddr,(uint8_t*)&msg,sizeof(msg));
 }
-// Send the same message to every other known board
 void sendAll(MsgType type, uint8_t d0=0,uint8_t d1=0,uint8_t d2=0,uint8_t d3=0) {
   for(int r=1;r<=5;r++) if(r!=myRole&&roleKnown[r]) sendMsg(type,(uint8_t)r,d0,d1,d2,d3);
+}
+
+bool addPeer(uint8_t *mac) {
+  if(esp_now_is_peer_exist(mac)) return true;
+  esp_now_peer_info_t p={}; memcpy(p.peer_addr,mac,6); p.channel=0; p.encrypt=false;
+  return esp_now_add_peer(&p)==ESP_OK;
+}
+int macCmp(uint8_t *a, uint8_t *b) {
+  for(int i=0;i<6;i++) { if(a[i]<b[i]) return -1; if(a[i]>b[i]) return 1; }
+  return 0;
 }
 
 void onRecv(const esp_now_recv_info *ri, const uint8_t *data, int len) {
   if(len < (int)sizeof(Message)) return;
   const Message *m = (const Message*)data;
-  if(m->dstRole!=0 && m->dstRole!=myRole) return; // not addressed to me
+  if(m->dstRole!=0 && m->dstRole!=myRole) return;
+
+  // Sync counters updated immediately — never lost even during blocking animations
+  if(m->type==MSG_ROLE_READY && m->srcRole>=1 && m->srcRole<=5)
+    gReadySet |= (uint8_t)(1 << m->srcRole);
+  if(m->type==MSG_SETUP_DONE && m->srcRole>=1 && m->srcRole<=5)
+    gSetupSet |= (uint8_t)(1 << m->srcRole);
+
+  // Auto-reconnect: a known peer has rebooted and is searching again
+  if(m->type==MSG_HELLO && myRole!=0) {
+    for(int r=1; r<=5; r++) {
+      if(roleKnown[r] && macCmp((uint8_t*)ri->src_addr, roleMac[r])==0) {
+        reconnectNeeded=true; break;
+      }
+    }
+  }
+
   msgType=m->type; msgSrcRole=m->srcRole; msgDstRole=m->dstRole;
   msgData[0]=m->d[0]; msgData[1]=m->d[1]; msgData[2]=m->d[2]; msgData[3]=m->d[3];
   memcpy(msgSenderMac, ri->src_addr, 6);
@@ -398,30 +471,21 @@ void onRecv(const esp_now_recv_info *ri, const uint8_t *data, int len) {
 }
 void onSent(const wifi_tx_info_t*, esp_now_send_status_t) {}
 
-bool addPeer(uint8_t *mac) {
-  if(esp_now_is_peer_exist(mac)) return true;
-  esp_now_peer_info_t p={}; memcpy(p.peer_addr,mac,6); p.channel=0; p.encrypt=false;
-  return esp_now_add_peer(&p)==ESP_OK;
-}
-// Compare MACs: negative/zero/positive like strcmp
-int macCmp(uint8_t *a, uint8_t *b) {
-  for(int i=0;i<6;i++) { if(a[i]<b[i]) return -1; if(a[i]>b[i]) return 1; }
-  return 0;
-}
-
-// ── Discovery — collect 5 MACs, sort, assign role ─────────────
+// ── Discovery — collect 5 MACs, assign roles, sync ────────────
 bool discoveryLoop() {
+  reconnectNeeded=false;
   WiFi.macAddress(myMac);
   uint8_t allMacs[5][6]; memcpy(allMacs[0],myMac,6); int numMacs=1;
   memset(roleKnown,0,sizeof(roleKnown));
   msgPending=false;
+  gReadySet=0; gSetupSet=0;
   unsigned long lastB=0; int af=0; unsigned long at=0;
 
-  // Phase 1: collect all 5 MACs via MSG_HELLO broadcasts
+  // ── Phase 1: collect 5 unique MACs via MSG_HELLO ──────────
   while(numMacs < 5) {
     if(digitalRead(RESET_PIN)==LOW){delay(50);if(digitalRead(RESET_PIN)==LOW)return false;}
     if(millis()-lastB > 600) { sendMsg(MSG_HELLO,0); lastB=millis(); }
-    if(millis()-at > 90) { searchAnim(af++); at=millis(); }
+    if(millis()-at > 90)     { searchAnim(af++); at=millis(); }
     if(msgPending) {
       msgPending=false;
       if(msgType==MSG_HELLO) {
@@ -433,7 +497,7 @@ bool discoveryLoop() {
     delay(10);
   }
 
-  // Bubble sort allMacs ascending → assign role by sorted index
+  // Sort ascending → deterministic role assignment on every board
   for(int i=0;i<4;i++) for(int j=0;j<4-i;j++) {
     if(macCmp(allMacs[j],allMacs[j+1])>0) {
       uint8_t tmp[6]; memcpy(tmp,allMacs[j],6); memcpy(allMacs[j],allMacs[j+1],6); memcpy(allMacs[j+1],tmp,6);
@@ -441,7 +505,6 @@ bool discoveryLoop() {
   }
   for(int i=0;i<5;i++) if(macCmp(allMacs[i],myMac)==0) myRole=(uint8_t)(i+1);
 
-  // Register all other boards as ESP-NOW peers
   for(int i=0;i<5;i++) {
     if(macCmp(allMacs[i],myMac)==0) continue;
     uint8_t role=(uint8_t)(i+1);
@@ -451,53 +514,55 @@ bool discoveryLoop() {
   }
   roleKnown[myRole]=true;
 
-  // Flash role color so each player knows where to place their board
-  strip.clear(); strip.show();
+  // Mark own bit before flash so late boards joining Phase 2 already see it
+  gReadySet |= (uint8_t)(1 << myRole);
+
+  // Non-blocking role flash (gReadySet updated in onRecv during each 10 ms tick)
   roleFlash(myRole);
 
-  // Phase 2: sync — wait until all 5 boards have broadcast ROLE_READY
-  uint8_t readySet = (uint8_t)(1 << myRole);  // bit i = role i is ready
+  // ── Phase 2: wait until all 5 boards have acknowledged ────
+  // gReadySet is written by onRecv in the ESP-NOW task — no messages missed.
   unsigned long lastR=0;
-  while(readySet != 0x3E) {   // 0x3E = bits 1-5 all set
+  while(gReadySet != 0x3E) {   // 0x3E = bits 1-5 all set
     if(digitalRead(RESET_PIN)==LOW){delay(50);if(digitalRead(RESET_PIN)==LOW)return false;}
-    if(millis()-lastR > 500) { sendMsg(MSG_ROLE_READY,0); lastR=millis(); }
+    if(millis()-lastR > 400) { sendMsg(MSG_ROLE_READY,0); lastR=millis(); }
     uint8_t pulse=(uint8_t)(60+60*sinf(millis()*0.005f));
     strip.clear();
     if(myRole==5) {
-      for(int c=0;c<8;c++) strip.setPixelColor(c,        strip.Color(0,0,0,pulse));
-      for(int c=0;c<8;c++) strip.setPixelColor(56+c,     strip.Color(pulse,0,0,0));
-      for(int r=0;r<8;r++) strip.setPixelColor(r*8,      strip.Color(0,pulse,0,0));
-      for(int r=0;r<8;r++) strip.setPixelColor(r*8+7,    strip.Color(0,0,pulse,0));
+      for(int c=0;c<8;c++) strip.setPixelColor(c,     strip.Color(0,0,0,pulse));
+      for(int c=0;c<8;c++) strip.setPixelColor(56+c,  strip.Color(pulse,0,0,0));
+      for(int r=0;r<8;r++) strip.setPixelColor(r*8,   strip.Color(0,pulse,0,0));
+      for(int r=0;r<8;r++) strip.setPixelColor(r*8+7, strip.Color(0,0,pulse,0));
     } else {
       strip.setPixelColor(27,pColor(myRole)); strip.setPixelColor(28,pColor(myRole));
       strip.setPixelColor(35,pColor(myRole)); strip.setPixelColor(36,pColor(myRole));
     }
     strip.show();
-    if(msgPending) {
-      msgPending=false;
-      if(msgType==MSG_ROLE_READY) readySet|=(uint8_t)(1<<msgSrcRole);
-      if(msgType==MSG_RESET) return false;
-    }
+    if(msgPending){msgPending=false; if(msgType==MSG_RESET)return false;}
     delay(20);
   }
+
+  // Grace period: keep broadcasting for 2 s so any board still in Phase 1
+  // has time to finish and enter Phase 2 before everyone moves on.
+  unsigned long graceEnd=millis()+2000;
+  while(millis()<graceEnd) {
+    if(digitalRead(RESET_PIN)==LOW){delay(50);if(digitalRead(RESET_PIN)==LOW)return false;}
+    if(millis()-lastR > 400) { sendMsg(MSG_ROLE_READY,0); lastR=millis(); }
+    if(msgPending){msgPending=false; if(msgType==MSG_RESET)return false;}
+    delay(20);
+  }
+
   strip.clear(); strip.show(); delay(200);
   return true;
 }
 
-// ── Setup — place home pieces, sync, start game ───────────────
-// Returns true for squares that are on the "center-facing" side of this board
-bool isNearCenter(int lr, int lc) {
-  switch(myRole) {
-    case 1: return lr >= 6;   // P1 top arm: local rows 6-7 face center
-    case 2: return lc >= 6;   // P2 left arm: local cols 6-7 face center
-    case 3: return lc <= 1;   // P3 right arm: local cols 0-1 face center
-    case 4: return lr <= 1;   // P4 bottom arm: local rows 0-1 face center
-  }
-  return false;
-}
-
+// ── Setup — place pieces, sync all boards ─────────────────────
 bool setupPhase() {
-  // CENTER shows edges immediately; player boards wait for pieces
+  gSetupSet |= (uint8_t)(1 << myRole); // mark myself ready to start counting
+
+  // All players have their back rank at local row 0 and pawns at local row 1.
+  // Local rows 6-7 face the center — glow them in the player's color as a
+  // visual orientation guide. The CENTER board just shows its colored edges.
   bool piecesOk = (myRole == 5);
   while(!piecesOk) {
     if(digitalRead(RESET_PIN)==LOW){delay(50);if(digitalRead(RESET_PIN)==LOW){strip.clear();strip.show();return false;}}
@@ -505,15 +570,15 @@ bool setupPhase() {
     piecesOk=true;
     strip.clear();
     for(int lr=0;lr<8;lr++) for(int lc=0;lc<8;lc++) {
-      int gr=gRow(lr), gc=gCol(lc);
-      bool near=isNearCenter(lr,lc);
-      bool hasPiece=sensor[lr][lc];
-      uint8_t expected=gBoard[gr][gc];
-      if(near) {
-        strip.setPixelColor(lr*8+lc, pColor(myRole));  // glow facing edge
+      int gr=gRow(lr,lc), gc=gCol(lr,lc);
+      bool nearCenter = (lr >= 6);          // same for every player role
+      bool hasPiece   = sensor[lr][lc];
+      uint8_t expected = gBoard[gr][gc];
+      if(nearCenter) {
+        strip.setPixelColor(lr*8+lc, pColor(myRole));   // glow near-center rows
       } else if(!isEm(expected) && plOf(expected)==myRole && !hasPiece) {
         piecesOk=false;
-        strip.setPixelColor(lr*8+lc, dimColor(myRole)); // placement guide
+        strip.setPixelColor(lr*8+lc, dimColor(myRole)); // missing piece guide
       }
     }
     strip.show();
@@ -523,21 +588,21 @@ bool setupPhase() {
   // Green "all pieces placed" flash
   for(int f=0;f<2;f++) { for(int i=0;i<LED_COUNT;i++) strip.setPixelColor(i,strip.Color(0,150,0,0)); strip.show(); delay(200); strip.clear(); strip.show(); delay(200); }
 
-  // Wait for all boards to confirm setup
-  uint8_t readySet=(uint8_t)(1<<myRole);
+  // Wait for all boards to confirm, then hold briefly so late boards catch up
   unsigned long lastS=0;
-  while(readySet != 0x3E) {
+  while(gSetupSet != 0x3E) {
     if(digitalRead(RESET_PIN)==LOW){delay(50);if(digitalRead(RESET_PIN)==LOW){strip.clear();strip.show();return false;}}
     if(millis()-lastS > 500) { sendMsg(MSG_SETUP_DONE,0); lastS=millis(); }
     if(myRole==5) centerEdges();
-    if(msgPending) {
-      msgPending=false;
-      if(msgType==MSG_SETUP_DONE) readySet|=(uint8_t)(1<<msgSrcRole);
-      if(msgType==MSG_RESET) { strip.clear(); strip.show(); return false; }
-    }
+    if(msgPending){msgPending=false; if(msgType==MSG_RESET){strip.clear();strip.show();return false;}}
     delay(20);
   }
-  sendMsg(MSG_SETUP_DONE, 0);
+  unsigned long graceEnd=millis()+1000;
+  while(millis()<graceEnd) {
+    if(millis()-lastS > 500) { sendMsg(MSG_SETUP_DONE,0); lastS=millis(); }
+    if(msgPending){msgPending=false; if(msgType==MSG_RESET){strip.clear();strip.show();return false;}}
+    delay(20);
+  }
   for(int f=0;f<2;f++) { for(int i=0;i<LED_COUNT;i++) strip.setPixelColor(i,pColor(myRole==5?1:myRole)); strip.show(); delay(200); strip.clear(); strip.show(); delay(200); }
   readSensors(); memcpy(sensorPrev,sensor,sizeof(sensor));
   return true;
@@ -547,15 +612,13 @@ bool setupPhase() {
 void glowMyPieces(int myPlayer) {
   strip.clear();
   for(int lr=0;lr<8;lr++) for(int lc=0;lc<8;lc++) {
-    int gr=gRow(lr), gc=gCol(lc); uint8_t p=gBoard[gr][gc];
+    int gr=gRow(lr,lc), gc=gCol(lr,lc); uint8_t p=gBoard[gr][gc];
     if(!isEm(p)&&plOf(p)==myPlayer) strip.setPixelColor(lr*8+lc,dimColor(myPlayer));
   }
   strip.show();
 }
 
-// Show legal-move hints with a cross-board distance-sorted ripple
 void showHints(int liftGR, int liftGC, bool liftOnMe, int mc, int mv[][2]) {
-  // Sort by distance from lift square
   for(int i=0;i<mc-1;i++) for(int j=0;j<mc-i-1;j++) {
     int dr0=mv[j][0]-liftGR,dc0=mv[j][1]-liftGC;
     int dr1=mv[j+1][0]-liftGR,dc1=mv[j+1][1]-liftGC;
@@ -570,12 +633,7 @@ void showHints(int liftGR, int liftGC, bool liftOnMe, int mc, int mv[][2]) {
     bool cap=(!isEm(gBoard[gr2][gc2]));
     uint32_t col=cap?strip.Color(255,60,0,0):strip.Color(0,0,0,180);
     if(onMe(gr2,gc2)) { setGLED(gr2,gc2,col); strip.show(); delay(30); }
-    else {
-      int dstR=squareRole(gr2,gc2);
-      strip.show();
-      sendMsg(MSG_HIGHLIGHT,(uint8_t)dstR,(uint8_t)gr2,(uint8_t)gc2,(uint8_t)(cap?1:0));
-      delay(30); // maintains ripple cadence on remote board
-    }
+    else { strip.show(); sendMsg(MSG_HIGHLIGHT,(uint8_t)squareRole(gr2,gc2),(uint8_t)gr2,(uint8_t)gc2,(uint8_t)(cap?1:0)); delay(30); }
   }
   strip.show();
 }
@@ -591,7 +649,7 @@ void restoreHintsLocal(int liftGR, int liftGC, bool liftOnMe, int mc, int mv[][2
 }
 
 // ═══════════════════════════════════════════════════════════════
-// ACTIVE TURN — called on the board whose player is moving
+// ACTIVE TURN
 // ═══════════════════════════════════════════════════════════════
 bool handleActiveTurn(int myPlayer) {
   glowMyPieces(myPlayer);
@@ -601,14 +659,15 @@ bool handleActiveTurn(int myPlayer) {
   bool hintsShown=false;
 
   while(true) {
+    if(reconnectNeeded)                       return false;
     if(digitalRead(RESET_PIN)==LOW){delay(50);if(digitalRead(RESET_PIN)==LOW){sendAll(MSG_RESET);strip.clear();strip.show();return false;}}
     readSensors();
 
-    // ── Phase 1: look for a lift ──────────────────────────
+    // Phase 1: look for a lift
     if(liftGR == -1) {
       for(int lr=0;lr<8;lr++) for(int lc=0;lc<8;lc++) {
         if(!sensorPrev[lr][lc]||sensor[lr][lc]) continue;
-        int gr=gRow(lr),gc=gCol(lc); uint8_t p=gBoard[gr][gc]; if(isEm(p)) continue;
+        int gr=gRow(lr,lc),gc=gCol(lr,lc); uint8_t p=gBoard[gr][gc]; if(isEm(p)) continue;
         if(plOf(p)==myPlayer){liftGR=gr;liftGC=gc;liftOnMe=true;break;}
       }
       if(!liftOnMe&&msgPending) {
@@ -619,18 +678,20 @@ bool handleActiveTurn(int myPlayer) {
       }
     }
 
-    // ── Phase 2: process lift (once) ──────────────────────
+    // Phase 2: compute and display legal moves
     if(liftGR != -1 && !hintsShown) {
       getMoves(liftGR,liftGC,mc,mv);
       if(mc == 0) {
         illegalFlash(liftGR,liftGC);
         if(liftOnMe) {
-          while(!sensor[locR(liftGR)][locC(liftGC)]) {
+          while(!sensor[locR(liftGR,liftGC)][locC(liftGR,liftGC)]) {
+            if(reconnectNeeded){strip.clear();strip.show();return false;}
             if(digitalRead(RESET_PIN)==LOW){delay(50);if(digitalRead(RESET_PIN)==LOW){sendAll(MSG_RESET);strip.clear();strip.show();return false;}}
             readSensors(); memcpy(sensorPrev,sensor,sizeof(sensor)); delay(40);
           }
         } else {
           while(true) {
+            if(reconnectNeeded){strip.clear();strip.show();return false;}
             if(digitalRead(RESET_PIN)==LOW){delay(50);if(digitalRead(RESET_PIN)==LOW){sendAll(MSG_RESET);strip.clear();strip.show();return false;}}
             if(msgPending){msgPending=false;if(msgType==MSG_CANCEL)break;if(msgType==MSG_RESET)return false;}
             delay(20);
@@ -644,20 +705,20 @@ bool handleActiveTurn(int myPlayer) {
       hintsShown=true;
     }
 
-    // ── Phase 3: wait for placement ───────────────────────
+    // Phase 3: wait for placement
     if(liftGR != -1 && hintsShown) {
-      // Piece returned to its origin square (local lift only)
-      if(liftOnMe && sensor[locR(liftGR)][locC(liftGC)] && !sensorPrev[locR(liftGR)][locC(liftGC)]) {
+      // Piece returned to origin (local lift)
+      if(liftOnMe && sensor[locR(liftGR,liftGC)][locC(liftGR,liftGC)] && !sensorPrev[locR(liftGR,liftGC)][locC(liftGR,liftGC)]) {
         sendAll(MSG_CLEAR);
         strip.clear(); strip.show();
         liftGR=-1; liftGC=-1; mc=0; hintsShown=false;
         glowMyPieces(myPlayer);
         memcpy(sensorPrev,sensor,sizeof(sensor)); continue;
       }
-      // Local placement on my board
+      // Local placement
       for(int lr=0;lr<8;lr++) for(int lc=0;lc<8;lc++) {
         if(!sensor[lr][lc]||sensorPrev[lr][lc]) continue;
-        int gr=gRow(lr), gc=gCol(lc);
+        int gr=gRow(lr,lc), gc=gCol(lr,lc);
         if(inLegal(gr,gc,mc,mv)) {
           applyMoveToBoard(liftGR,liftGC,gr,gc);
           sendAll(MSG_MOVE,(uint8_t)liftGR,(uint8_t)liftGC,(uint8_t)gr,(uint8_t)gc);
@@ -674,7 +735,7 @@ bool handleActiveTurn(int myPlayer) {
           restoreHintsLocal(liftGR,liftGC,liftOnMe,mc,mv);
         }
       }
-      // Cross-board placement reported by another board
+      // Cross-board placement
       if(msgPending) {
         msgPending=false;
         if(msgType==MSG_PLACED) {
@@ -704,8 +765,7 @@ bool handleActiveTurn(int myPlayer) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// PASSIVE TURN — all boards not currently moving
-// (includes CENTER which is always passive)
+// PASSIVE TURN  (non-active players + CENTER, always)
 // ═══════════════════════════════════════════════════════════════
 bool handlePassiveTurn(int activePl) {
   hlCount=0;
@@ -713,10 +773,10 @@ bool handlePassiveTurn(int activePl) {
   int liftGR=-1, liftGC=-1, liftLR=-1, liftLC=-1;
 
   while(true) {
+    if(reconnectNeeded)                       return false;
     if(digitalRead(RESET_PIN)==LOW){delay(50);if(digitalRead(RESET_PIN)==LOW){sendAll(MSG_RESET);strip.clear();strip.show();return false;}}
     readSensors();
 
-    // ── Handle incoming messages ───────────────────────────
     if(msgPending) {
       msgPending=false;
       switch(msgType) {
@@ -747,12 +807,11 @@ bool handlePassiveTurn(int activePl) {
       }
     }
 
-    // ── Detect active player's piece lift on MY board ──────
-    // (happens when that player previously moved a piece here)
+    // Detect active player's piece lifted on MY board (cross-board move start)
     if(liftGR == -1) {
       for(int lr=0;lr<8;lr++) for(int lc=0;lc<8;lc++) {
         if(!sensorPrev[lr][lc]||sensor[lr][lc]) continue;
-        int gr=gRow(lr),gc=gCol(lc); uint8_t p=gBoard[gr][gc]; if(isEm(p)) continue;
+        int gr=gRow(lr,lc),gc=gCol(lr,lc); uint8_t p=gBoard[gr][gc]; if(isEm(p)) continue;
         if(plOf(p)==activePl) {
           liftGR=gr; liftGC=gc; liftLR=lr; liftLC=lc;
           sendMsg(MSG_LIFT,(uint8_t)activePl,(uint8_t)gr,(uint8_t)gc);
@@ -761,7 +820,7 @@ bool handlePassiveTurn(int activePl) {
       }
     }
 
-    // ── Cross-board lift: watch for piece returned ─────────
+    // Piece returned to its square (cancel cross-board move)
     if(liftGR != -1) {
       if(sensor[liftLR][liftLC] && !sensorPrev[liftLR][liftLC]) {
         sendMsg(MSG_CANCEL,(uint8_t)activePl);
@@ -771,18 +830,16 @@ bool handlePassiveTurn(int activePl) {
       }
     }
 
-    // ── Watch for placement on any highlighted square ──────
-    // Handles both: active piece carried from their own board,
-    // and active piece already here being repositioned.
+    // Placement on any highlighted square
     if(hlCount > 0) {
       for(int lr=0;lr<8;lr++) for(int lc=0;lc<8;lc++) {
         if(!sensor[lr][lc]||sensorPrev[lr][lc]) continue;
-        int gr=gRow(lr), gc=gCol(lc);
+        int gr=gRow(lr,lc), gc=gCol(lr,lc);
         if(isHL(gr,gc)) {
           setGLED(gr,gc,strip.Color(0,255,0,0)); strip.show();
           sendMsg(MSG_PLACED,(uint8_t)activePl,(uint8_t)gr,(uint8_t)gc);
-          // Wait for MSG_MOVE confirmation
           while(true) {
+            if(reconnectNeeded){strip.clear();strip.show();return false;}
             if(digitalRead(RESET_PIN)==LOW){delay(50);if(digitalRead(RESET_PIN)==LOW){sendAll(MSG_RESET);strip.clear();strip.show();return false;}}
             if(msgPending) {
               msgPending=false;
@@ -798,20 +855,19 @@ bool handlePassiveTurn(int activePl) {
             delay(20);
           }
         } else {
-          // Not a highlighted square — flash amber, restore display
           illegalFlash(gr,gc);
           strip.clear();
           for(int i=0;i<hlCount;i++)
             if(onMe(hlList[i].gr,hlList[i].gc))
               setGLED(hlList[i].gr,hlList[i].gc, hlList[i].type==1?strip.Color(255,60,0,0):strip.Color(0,0,0,180));
-          restorePassiveDisplay(); // re-draw edges on top if CENTER
+          restorePassiveDisplay();
           strip.show();
         }
       }
     }
 
     memcpy(sensorPrev,sensor,sizeof(sensor));
-    delay(20); // short interval keeps highlight ripple responsive
+    delay(20);
   }
 }
 
@@ -841,7 +897,7 @@ void setup() {
 // ── Main game loop ────────────────────────────────────────────
 int nextActiveTurn(int cur) {
   for(int i=1;i<=4;i++) { int n=(cur%4)+1; cur=n; if(!eliminated[n]) return n; }
-  return -1; // all eliminated
+  return -1;
 }
 
 void loop() {
@@ -851,33 +907,35 @@ void loop() {
   if(!discoveryLoop()) { strip.clear(); strip.show(); return; }
   if(!setupPhase())    { strip.clear(); strip.show(); return; }
 
-  int activeTurn = 1;  // P1 goes first
+  int activeTurn = 1;
 
   while(true) {
+    // A known peer has rebooted — all boards restart discovery together
+    if(reconnectNeeded) {
+      sendAll(MSG_RESET);
+      strip.clear(); strip.show();
+      delay(500);
+      return; // loop() restarts from the top
+    }
     if(digitalRead(RESET_PIN)==LOW){delay(50);if(digitalRead(RESET_PIN)==LOW){sendAll(MSG_RESET);strip.clear();strip.show();return;}}
 
-    // Run the correct handler for this turn
     bool ok;
     if(myRole!=5 && myRole==activeTurn) ok=handleActiveTurn(activeTurn);
     else                                 ok=handlePassiveTurn(activeTurn);
     if(!ok){ strip.clear(); strip.show(); return; }
 
-    // Advance to next non-eliminated player
     activeTurn = nextActiveTurn(activeTurn);
 
-    // Count surviving players
     int remaining=0, lastSurvivor=0;
     for(int pl=1;pl<=4;pl++) if(!eliminated[pl]){ remaining++; lastSurvivor=pl; }
     if(remaining<=1) {
-      // Game over — celebrate the winner (or draw if none left)
       if(remaining==1 && myRole==lastSurvivor) {
         for(int f=0;f<8;f++){ for(int i=0;i<LED_COUNT;i++) strip.setPixelColor(i,(f%2==0)?pColor(lastSurvivor):0); strip.show(); delay(250); }
       }
       delay(5000); return;
     }
-    if(activeTurn < 0){ delay(3000); return; } // fallback
+    if(activeTurn < 0){ delay(3000); return; }
 
-    // Warn if next player is in check
     if(myRole==activeTurn && isKingInCheck(activeTurn)) checkFlash();
   }
 }
