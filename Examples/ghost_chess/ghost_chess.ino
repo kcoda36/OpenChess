@@ -33,7 +33,7 @@ const int ROW_PINS[8] = {42, 41, 40, 39, 38, 37, 36, 35};
 
 #define RESET_PIN 9   // IO9 → reset / return to discovery
 
-Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_RGBW + NEO_KHZ800);
+Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRBW + NEO_KHZ800);
 
 // ── ESP-NOW messaging ─────────────────────────────────────────
 enum MsgType : uint8_t { MSG_HELLO=0, MSG_READY, MSG_MOVE, MSG_RESET, MSG_PING, MSG_ACK };
@@ -63,17 +63,23 @@ bool sensorState[8][8];
 bool sensorPrev[8][8];
 
 const char initialBoard[8][8] = {
-  {'R','N','B','Q','K','B','N','R'},
+  {'R','N','B','K','Q','B','N','R'},
   {'P','P','P','P','P','P','P','P'},
   {' ',' ',' ',' ',' ',' ',' ',' '},
   {' ',' ',' ',' ',' ',' ',' ',' '},
   {' ',' ',' ',' ',' ',' ',' ',' '},
   {' ',' ',' ',' ',' ',' ',' ',' '},
   {'p','p','p','p','p','p','p','p'},
-  {'r','n','b','q','k','b','n','r'}
+  {'r','n','b','k','q','b','n','r'}
 };
 
 char board[8][8];
+
+// Last move destination (flashes blue on both boards until next move)
+int lastMoveRow = -1;
+int lastMoveCol = -1;
+bool lastMoveBlinkOn = true;
+unsigned long lastMoveBlinkMs = 0;
 
 // ═══════════════════════════════════════════════════════════════
 // HARDWARE
@@ -146,7 +152,7 @@ bool checkMyPiecesPlaced() {
   return true;
 }
 
-// Permanently display opponent's pieces as dim purple ghost LEDs
+// Permanently display opponent's pieces as dim blue ghost LEDs
 void showGhosts() {
   strip.clear();
   char oppColor = iAmWhite ? 'b' : 'w';
@@ -156,8 +162,18 @@ void showGhosts() {
       if (p == ' ') continue;
       bool isOpp = (oppColor=='b') ? (p>='a'&&p<='z') : (p>='A'&&p<='Z');
       if (isOpp)
-        strip.setPixelColor(r*8+c, strip.Color(80, 0, 200, 0));
+        strip.setPixelColor(r*8+c, strip.Color(0, 0, 255, 0));
     }
+
+  // Overlay the latest move destination as a blinking blue square.
+  if (lastMoveRow >= 0 && lastMoveRow < 8 && lastMoveCol >= 0 && lastMoveCol < 8) {
+    if (millis() - lastMoveBlinkMs >= 280) {
+      lastMoveBlinkMs = millis();
+      lastMoveBlinkOn = !lastMoveBlinkOn;
+    }
+    if (lastMoveBlinkOn)
+      strip.setPixelColor(lastMoveRow*8+lastMoveCol, strip.Color(0, 0, 255, 0));
+  }
   strip.show();
 }
 
@@ -327,6 +343,16 @@ bool isInCheck(char color) {
   return false;
 }
 
+// Fills kr, kc with king position; returns true if found.
+bool getKingPosition(char color, int &kr, int &kc) {
+  char king = (color=='w') ? 'K' : 'k';
+  kr = -1; kc = -1;
+  for (int r = 0; r < 8; r++)
+    for (int c = 0; c < 8; c++)
+      if (board[r][c] == king) { kr = r; kc = c; return true; }
+  return false;
+}
+
 void getPossibleMoves(int row, int col, int &moveCount, int moves[][2]) {
   moveCount = 0;
   char piece = board[row][col];
@@ -430,6 +456,11 @@ void initBoard() {
   for (int r = 0; r < 8; r++)
     for (int c = 0; c < 8; c++)
       board[r][c] = initialBoard[r][c];
+
+  lastMoveRow = -1;
+  lastMoveCol = -1;
+  lastMoveBlinkOn = true;
+  lastMoveBlinkMs = millis();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -611,22 +642,82 @@ bool reconnectMidGame() {
   return false;
 }
 
+
+void flashSquareColor(int row, int col, uint32_t color, int times=3, int onMs=160, int offMs=110) {
+  for (int f = 0; f < times; f++) {
+    showGhosts();
+    strip.setPixelColor(row*8+col, color);
+    strip.show();
+    delay(onMs);
+
+    showGhosts();
+    delay(offMs);
+  }
+}
+
+void solidSquareColor(int row, int col, uint32_t color, int ms=250) {
+  showGhosts();
+  strip.setPixelColor(row*8+col, color);
+  strip.show();
+  delay(ms);
+  showGhosts();
+}
+
+void capturedPieceWaitingBlue(int row, int col) {
+  showGhosts();
+  strip.setPixelColor(row*8+col, strip.Color(0, 0, 255, 0));
+  strip.show();
+}
+
+void checkBlinkKing(char color) {
+  char king = (color=='w') ? 'K' : 'k';
+  int kr = -1, kc = -1;
+
+  for (int r = 0; r < 8; r++) {
+    for (int c = 0; c < 8; c++) {
+      if (board[r][c] == king) {
+        kr = r;
+        kc = c;
+        break;
+      }
+    }
+    if (kr != -1) break;
+  }
+
+  if (kr == -1) return;
+
+  for (int f = 0; f < 5; f++) {
+    showGhosts();
+    strip.setPixelColor(kr*8+kc, strip.Color(255, 0, 0, 0));
+    strip.show();
+    delay(180);
+
+    showGhosts();
+    delay(140);
+  }
+}
+
+
 // Send MSG_MOVE and wait for MSG_ACK; retries up to 5 times.
 // Responds to incoming pings while waiting. Returns true if acked.
 bool sendMoveWithRetry(uint8_t fr, uint8_t fc, uint8_t tr, uint8_t tc) {
   for (int attempt = 0; attempt < 5; attempt++) {
     moveAckd = false;
     sendMsg(MSG_MOVE, fr, fc, tr, tc);
+
     Serial.printf("[Ghost-Chess] Move sent (try %d): %c%d->%c%d\n",
-                  attempt+1, 'A'+fc, fr+1, 'A'+tc, tr+1);
+                  attempt + 1, 'A' + fc, fr + 1, 'A' + tc, tr + 1);
+
     unsigned long t = millis();
     while (!moveAckd && millis() - t < 1500) {
-      if (pongPending) { pongPending = false; sendMsg(MSG_ACK); }
       delay(20);
     }
+
     if (moveAckd) return true;
+
     delay(300 * (attempt + 1));
   }
+
   return false;
 }
 
@@ -641,9 +732,23 @@ bool handleMyTurn() {
   // Show opponent ghosts while waiting for the player to pick up a piece
   showGhosts();
 
+  static unsigned long lastKingFlashMs = 0;
   while (true) {
     if (digitalRead(RESET_PIN)==LOW) { delay(50); if (digitalRead(RESET_PIN)==LOW) { sendMsg(MSG_RESET); return false; } }
     if (pongPending) { pongPending = false; sendMsg(MSG_ACK); }
+
+    // When in check, keep flashing the king red until it's moved to a new square
+    int kr, kc;
+    if (isInCheck(myColor) && getKingPosition(myColor, kr, kc) && (millis() - lastKingFlashMs >= 300)) {
+      lastKingFlashMs = millis();
+      showGhosts();
+      strip.setPixelColor(kr*8+kc, strip.Color(255, 0, 0, 0));
+      strip.show();
+      delay(150);
+      showGhosts();
+      strip.show();
+      delay(150);
+    }
 
     readSensors();
 
@@ -731,9 +836,39 @@ bool handleMyTurn() {
               if (legal) {
                 toRow=r2; toCol=c2; placed=true;
               } else {
-                // Illegal square — flash yellow then restore legal-move display
-                strip.setPixelColor(r2*8+c2, strip.Color(200,150,0,0));
-                strip.show(); delay(400);
+                // Illegal square — keep flashing yellow until that piece is removed
+                while (sensorState[r2][c2]) {
+                  if (digitalRead(RESET_PIN)==LOW) {
+                    delay(50);
+                    if (digitalRead(RESET_PIN)==LOW) {
+                      sendMsg(MSG_RESET); strip.clear(); strip.show(); return false;
+                    }
+                  }
+
+                  showGhosts();
+                  strip.setPixelColor(row*8+col, strip.Color(0,0,0,200));
+                  for (int i=0;i<moveCount;i++) {
+                    int mr=moves[i][0], mc=moves[i][1];
+                    bool cap=(board[mr][mc]!=' ');
+                    strip.setPixelColor(mr*8+mc, cap ? strip.Color(255,60,0,0) : strip.Color(0,0,0,180));
+                  }
+                  strip.setPixelColor(r2*8+c2, strip.Color(200,150,0,0));
+                  strip.show();
+                  delay(170);
+
+                  showGhosts();
+                  strip.setPixelColor(row*8+col, strip.Color(0,0,0,200));
+                  for (int i=0;i<moveCount;i++) {
+                    int mr=moves[i][0], mc=moves[i][1];
+                    bool cap=(board[mr][mc]!=' ');
+                    strip.setPixelColor(mr*8+mc, cap ? strip.Color(255,60,0,0) : strip.Color(0,0,0,180));
+                  }
+                  strip.show();
+                  delay(120);
+
+                  readSensors();
+                }
+
                 showGhosts();
                 strip.setPixelColor(row*8+col, strip.Color(0,0,0,200));
                 for (int i=0;i<moveCount;i++) {
@@ -760,6 +895,10 @@ bool handleMyTurn() {
         board[toRow][toCol] = piece;
         board[row][col] = ' ';
         applyPromotion(toRow, toCol);
+        lastMoveRow = toRow;
+        lastMoveCol = toCol;
+        lastMoveBlinkOn = true;
+        lastMoveBlinkMs = millis();
 
         // Send move to peer (with ACK retry + reconnect fallback)
         bool ackd = sendMoveWithRetry((uint8_t)row,(uint8_t)col,(uint8_t)toRow,(uint8_t)toCol);
@@ -769,14 +908,8 @@ bool handleMyTurn() {
         }
         if (!ackd) { strip.clear(); strip.show(); return false; }
 
-        // Green confirmation blink over ghost display
-        for (int f = 0; f < 2; f++) {
-          showGhosts();
-          strip.setPixelColor(toRow*8+toCol, strip.Color(0,255,0,0));
-          strip.show(); delay(200);
-          showGhosts(); delay(200);
-        }
-        showGhosts(); // restore ghost display (board state now updated)
+        // Move confirmation: destination always lights up green (capture animation already played if needed)
+        solidSquareColor(toRow, toCol, strip.Color(0, 255, 0, 0), 350);
 
         readSensors();
         memcpy(sensorPrev, sensorState, sizeof(sensorState));
@@ -811,12 +944,23 @@ bool handleOpponentTurn() {
 
     if (msgPending) {
       msgPending = false;
+
       if (msgType == MSG_MOVE) {
-        fromRow=(int)msgData[0]; fromCol=(int)msgData[1];
-        toRow  =(int)msgData[2]; toCol  =(int)msgData[3];
-        Serial.printf("[Ghost-Chess] Received: %c%d -> %c%d\n",'A'+fromCol,fromRow+1,'A'+toCol,toRow+1);
-      } else if (msgType == MSG_RESET) {
-        strip.clear(); strip.show(); return false;
+        fromRow = (int)msgData[0];
+        fromCol = (int)msgData[1];
+        toRow   = (int)msgData[2];
+        toCol   = (int)msgData[3];
+
+        Serial.printf("[Ghost-Chess] Received: %c%d -> %c%d\n",
+                      'A' + fromCol, fromRow + 1, 'A' + toCol, toRow + 1);
+
+        // IMPORTANT: acknowledge receipt immediately
+        sendMsg(MSG_ACK);
+      }
+      else if (msgType == MSG_RESET) {
+        strip.clear();
+        strip.show();
+        return false;
       }
     }
 
@@ -847,21 +991,41 @@ bool handleOpponentTurn() {
   board[toRow][toCol] = piece;
   board[fromRow][fromCol] = ' ';
   applyPromotion(toRow, toCol);
+  lastMoveRow = toRow;
+  lastMoveCol = toCol;
+  lastMoveBlinkOn = true;
+  lastMoveBlinkMs = millis();
 
-  // If a physical piece of mine was captured, wait for player to remove it
+  // If a physical piece of mine was captured, flash red until player removes it, then blue for new piece
   if (capturedMine) {
     Serial.printf("[Ghost-Chess] Your piece at %c%d was captured — please remove it.\n",
                   'A'+toCol, toRow+1);
+
     readSensors();
     while (sensorState[toRow][toCol]) {
-      if (digitalRead(RESET_PIN)==LOW) { delay(50); if (digitalRead(RESET_PIN)==LOW) { sendMsg(MSG_RESET); strip.clear(); strip.show(); return false; } }
-      // Flash red: "remove this piece"
-      strip.setPixelColor(toRow*8+toCol, strip.Color(255,0,0,0));
-      strip.show(); delay(220);
-      strip.setPixelColor(toRow*8+toCol, 0);
-      strip.show(); delay(220);
+      if (digitalRead(RESET_PIN)==LOW) {
+        delay(50);
+        if (digitalRead(RESET_PIN)==LOW) {
+          sendMsg(MSG_RESET);
+          strip.clear();
+          strip.show();
+          return false;
+        }
+      }
+
+      // Keep flashing red on the capture square until they take the piece off
+      showGhosts();
+      strip.setPixelColor(toRow*8+toCol, strip.Color(255, 0, 0, 0));
+      strip.show();
+      delay(180);
+      showGhosts();
+      strip.show();
+      delay(120);
       readSensors();
     }
+
+    // Piece removed — show blue for the new (opponent's) piece there
+    showGhosts();
     memcpy(sensorPrev, sensorState, sizeof(sensorState));
   }
 
@@ -876,11 +1040,9 @@ bool handleOpponentTurn() {
   readSensors();
   memcpy(sensorPrev, sensorState, sizeof(sensorState));
 
-  // Flash red if the opponent's move put my king in check
-  if (isInCheck(myColor)) {
+  // If opponent's move put my king in check, we'll flash the king continuously in handleMyTurn()
+  if (isInCheck(myColor))
     Serial.println("[Ghost-Chess] Your king is in CHECK!");
-    checkFlash();
-  }
 
   showGhosts();
   return true;
@@ -1005,7 +1167,7 @@ void loop() {
       bool nextIsMe = (whiteTurn == iAmWhite);
       Serial.println(inCheck ? "CHECKMATE!" : "STALEMATE!");
 
-      if (inCheck) checkmateFlash();
+      if (inCheck) checkBlinkKing(nextColor);
 
       bool iWon = inCheck ? !nextIsMe : false;
       gameOverAnimation(iWon);
